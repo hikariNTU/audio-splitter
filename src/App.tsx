@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useRef, useState } from "react";
 import useResizeObserver from "./useResizeObserver";
-import { debounce } from "lodash";
+import { debounce, mean, sum } from "lodash";
 import { LoaderCircleIcon, DownloadIcon } from "lucide-react";
 import { audioBufferToWavBlob } from "./toWav";
 import { downloadFileFromUrl } from "./download";
@@ -10,11 +10,14 @@ type Info = {
   duration: number;
   sampleRate: number;
   channels: Array<AudioBuffer>;
+  channelsVolume: Array<number>;
+  monoRatio: number;
 };
 
+const MONO_THRESHOLD = 0.3;
 const blobs = new WeakMap<Info, string[]>();
 
-export default function App() {
+export default function Splitter() {
   const [obj, setObj] = useState<string>();
   const [name, setName] = useState<string>();
   const [info, setInfo] = useState<Info>();
@@ -39,7 +42,6 @@ export default function App() {
       mixer
         .loadData(obj)
         .then((info) => {
-          console.log(info);
           setInfo(info);
           blobs.set(
             info,
@@ -109,7 +111,17 @@ export default function App() {
                 key={`${idx}:${buffer.length}`}
                 className="flex flex-col gap-4 border-b border-neutral-500/30 pb-8 last-of-type:border-none"
               >
-                <span className="font-bold">{trackName}</span>
+                <span className="font-bold">
+                  {trackName}
+                  {idx === 0 && info.monoRatio < MONO_THRESHOLD ? (
+                    <span className="ml-2 text-red-600">
+                      偵測到聲紋相位抵銷，音量抵銷至{" "}
+                      {Math.round(info.monoRatio * 100)}%
+                    </span>
+                  ) : (
+                    ""
+                  )}
+                </span>
                 <div className="relative h-8">
                   <WaveBarCanvas arr={buffer.getChannelData(0)} />
                 </div>
@@ -153,11 +165,13 @@ class AudioMixer {
     }
     const buffer = await this.ctx.decodeAudioData(bufferData);
 
-    const info = {
+    const info: Info = {
       numberOfChannels: buffer.numberOfChannels,
       duration: buffer.duration,
       sampleRate: buffer.sampleRate,
-      channels: [] as Array<AudioBuffer>,
+      channels: [],
+      channelsVolume: [],
+      monoRatio: 0,
     };
 
     const offCtx = new OfflineAudioContext({
@@ -171,8 +185,13 @@ class AudioMixer {
     srcNode.connect(offCtx.destination);
     srcNode.start(0);
 
+    const chunksSize = Math.round(info.duration * 2000 + 10);
+
     const monoBuffer = await offCtx.startRendering();
     info.channels.push(monoBuffer);
+    info.channelsVolume.push(
+      sum(this.getCanvasData(monoBuffer.getChannelData(0), chunksSize)),
+    );
 
     for (let i = 0; i < buffer.numberOfChannels; i++) {
       const cb = this.ctx.createBuffer(
@@ -180,9 +199,14 @@ class AudioMixer {
         buffer.duration * buffer.sampleRate,
         buffer.sampleRate,
       );
-      cb.copyToChannel(buffer.getChannelData(i), 0);
+      const arr = buffer.getChannelData(i);
+      cb.copyToChannel(arr, 0);
       info.channels.push(cb);
+      info.channelsVolume.push(sum(this.getCanvasData(arr, chunksSize)));
     }
+
+    info.monoRatio =
+      info.channelsVolume[0] / mean(info.channelsVolume.slice(1));
 
     return info;
   }
